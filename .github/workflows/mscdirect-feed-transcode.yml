@@ -1,0 +1,87 @@
+name: Transcode MSC Direct feed to UTF-8
+
+# The Vinyl export publishes this LinkedIn feed as UTF-16LE bytes with an XML
+# prolog that (incorrectly) declares utf-8 — malformed, so MSEP's parser rejects
+# it. Vinyl runs on an old SQL Server whose xml/nvarchar output is natively
+# UTF-16, so we fix it downstream: re-encode the bytes to real UTF-8 and
+# republish to an S3 URL we control. Nothing in Vinyl changes.
+#
+# New URL handed to MSEP (served straight from S3, so no CDN cache to fight):
+#   https://s3.amazonaws.com/<FEED_DEST_BUCKET>/<FEED_DEST_KEY>
+
+on:
+  schedule:
+    # Every 30 min — source rebuilds a few times a day; keeps the mirror fresh.
+    - cron: "*/30 * * * *"
+  workflow_dispatch:
+    inputs:
+      src_url:
+        description: "Override source feed URL"
+        required: false
+      dest_key:
+        description: "Override destination S3 key"
+        required: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: transcode-mscdirect-feed
+  cancel-in-progress: false
+
+jobs:
+  transcode:
+    name: Fetch UTF-16 feed, re-encode to UTF-8, publish to S3
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      FEED_SRC_URL: ${{ github.event.inputs.src_url || 'https://s3.amazonaws.com/shazamme-vinyl-uploads-dev/mscdirect-jobs_dzconnex_com_LinkedIn.xml' }}
+      FEED_DEST_BUCKET: ${{ vars.FEED_DEST_BUCKET }}
+      FEED_DEST_KEY: ${{ github.event.inputs.dest_key || 'feeds/mscdirect-jobs_dzconnex_com_LinkedIn.xml' }}
+      FEED_CONTENT_TYPE: "application/xml; charset=utf-8"
+      FEED_CACHE_CONTROL: "public, max-age=300"
+      FEED_MIN_JOBS: "1"
+      # Optional — set as repo vars if the destination needs them:
+      FEED_ACL: ${{ vars.FEED_ACL }}
+      FEED_CF_DISTRIBUTION: ${{ vars.FEED_CF_DISTRIBUTION }}
+      AWS_DEFAULT_REGION: ${{ vars.AWS_REGION || 'us-east-1' }}
+
+    steps:
+      - name: Check out repo
+        uses: actions/checkout@v4
+
+      - name: Verify required secrets/vars are present
+        run: |
+          set -euo pipefail
+          missing=0
+          [ -z "${{ secrets.AWS_ACCESS_KEY_ID }}" ] && { echo "::error::AWS_ACCESS_KEY_ID secret not set"; missing=1; }
+          [ -z "${{ secrets.AWS_SECRET_ACCESS_KEY }}" ] && { echo "::error::AWS_SECRET_ACCESS_KEY secret not set"; missing=1; }
+          [ -z "${FEED_DEST_BUCKET}" ] && { echo "::error::FEED_DEST_BUCKET repo variable not set"; missing=1; }
+          [ "$missing" -eq 0 ] || exit 1
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_DEFAULT_REGION }}
+
+      - name: Transcode and publish
+        run: bash scripts/transcode-feed.sh
+
+      - name: Verify published feed
+        run: |
+          set -euo pipefail
+          url="https://s3.amazonaws.com/${FEED_DEST_BUCKET}/${FEED_DEST_KEY}"
+          echo "Verifying ${url}"
+          ct="$(curl -s -I "$url" | tr -d '\r' | awk -F': ' 'tolower($1)=="content-type"{print $2}')"
+          echo "Content-Type: ${ct}"
+          curl -s "$url" -o published.xml
+          xmllint --noout published.xml && echo "Published feed is well-formed UTF-8"
+          {
+            echo "## MSC Direct feed transcode"
+            echo ""
+            echo "- New URL: \`${url}\`"
+            echo "- Content-Type: \`${ct}\`"
+            echo "- Jobs: \`$(grep -c '</job>' published.xml || echo '?')\`"
+          } >> "$GITHUB_STEP_SUMMARY"
