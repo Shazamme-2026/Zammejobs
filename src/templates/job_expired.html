@@ -1,0 +1,55 @@
+{% extends "base.html" %}
+
+{% block title %}Job closed — {{ job.title }} at {{ job.employer_name }} | ZammeJobs{% endblock %}
+{% block meta_description %}This role — {{ job.title }} at {{ job.employer_name }} — is no longer accepting applications. Browse live jobs on ZammeJobs.{% endblock %}
+
+{# Expired postings are served as HTTP 410 and must NOT be indexed. No
+   JobPosting JSON-LD here — an expired schema on a 410 page is contradictory
+   and is what got the whole sitemap reclassified in the first place. #}
+{% block robots %}noindex, follow{% endblock %}
+
+{% block content %}
+<div class="job-detail">
+    <nav class="breadcrumbs" aria-label="Breadcrumb">
+        <ol>
+            <li><a href="/">Home</a></li>
+            <li><a href="/search">Jobs</a></li>
+            <li aria-current="page">Job closed</li>
+        </ol>
+    </nav>
+
+    <article class="job-detail-main">
+        <h1>This job is no longer available</h1>
+        <p class="employer-line">
+            <strong>{{ job.title }}</strong>{% if job.employer_name %} at {{ job.employer_name }}{% endif %}
+            {% if job.location.city or job.location.country %}
+            <span class="dot-sep">&middot;</span>{{ job.location.city or job.location.country }}
+            {% endif %}
+        </p>
+        <p>This posting has closed or expired. It's no longer accepting applications through ZammeJobs.</p>
+        <p><a class="btn-primary" href="/search">Search live jobs</a></p>
+
+        {% if similar_jobs %}
+        <section class="similar-block">
+            <h2>Live jobs like this one</h2>
+            <div class="similar-list">
+                {% for sim in similar_jobs %}
+                <a href="/jobs/{{ sim.id }}" class="similar-item">
+                    <div class="similar-title">{{ sim.title }}</div>
+                    <div class="similar-meta">
+                        {{ sim.employer_name }}
+                        {% if sim.location.city or sim.location.country %}
+                        <span class="dot-sep">&middot;</span>{{ sim.location.city or sim.location.country }}
+                        {% endif %}
+                    </div>
+                    {% if sim.salary.min %}
+                    <div class="similar-salary">{{ sim.salary.currency or "USD" }} {{ "{:,}".format(sim.salary.min) }}{% if sim.salary.max %}-{{ "{:,}".format(sim.salary.max) }}{% endif %}</div>
+                    {% endif %}
+                </a>
+                {% endfor %}
+            </div>
+        </section>
+        {% endif %}
+    </article>
+</div>
+{% endblock %}

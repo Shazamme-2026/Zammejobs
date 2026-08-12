@@ -24,6 +24,7 @@ from sqlalchemy import func, or_, select, text, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.api.schemas import JobLocation, JobSalary, JobSummary
+from src.config import settings
 from src.db import get_session
 from src.models import Employer, Job
 from src.normalizer.salary import currency_for_country
@@ -42,6 +43,22 @@ logger = logging.getLogger("zammejobs.frontend")
 
 router = APIRouter(tags=["Frontend"])
 templates = Jinja2Templates(directory="src/templates")
+
+
+def _is_expired_job(job: Job) -> bool:
+    """A job should not be served as a live, indexable page once it's expired.
+    True when the crawler has flipped status away from 'active', or the source's
+    explicit expiry has passed. date_expires is a naive UTC column, so compare
+    against utcnow(). date_updated-based expiry is handled by mark_stale_jobs
+    flipping status, so we don't re-derive it here."""
+    if job.status and job.status != "active":
+        return True
+    if job.date_expires is not None:
+        try:
+            return job.date_expires < datetime.utcnow()
+        except Exception:
+            return False
+    return False
 
 # Append ?v=<release> to every static asset URL so the browser drops
 # its cached copy whenever we ship. src/_version.py is the single
@@ -264,17 +281,23 @@ def _build_json_ld(job: Job, employer: Employer | None = None) -> str:
         except Exception:
             job_posting["datePosted"] = str(posted)[:10]
 
-    # validThrough — supply a sensible default (posted + 30 days) when the
-    # source has no explicit expiry. Stops Google flagging the post as
-    # "missing validThrough" and prevents indefinite-life listings.
+    # validThrough — prefer the source's explicit expiry. When absent, derive a
+    # ROLLING expiry from date_updated (refreshed on every crawl that re-confirms
+    # the job live) rather than a fixed posted+N. A fixed posted+30d lapses while
+    # the job is demonstrably still in the feed, and a lapsed validThrough makes
+    # Google drop the posting from Google Jobs and reclassify it "crawled –
+    # currently not indexed". Anchoring on date_updated + stale_job_days matches
+    # exactly when mark_stale_jobs would actually expire the job.
     if job.date_expires:
         job_posting["validThrough"] = job.date_expires.strftime("%Y-%m-%dT%H:%M:%S+00:00") if hasattr(job.date_expires, "strftime") else str(job.date_expires)[:10]
-    elif posted:
+    else:
         from datetime import timedelta as _td
-        try:
-            job_posting["validThrough"] = (posted + _td(days=30)).strftime("%Y-%m-%dT%H:%M:%S+00:00")
-        except Exception:
-            pass
+        anchor = getattr(job, "date_updated", None) or posted
+        if anchor:
+            try:
+                job_posting["validThrough"] = (anchor + _td(days=settings.stale_job_days)).strftime("%Y-%m-%dT%H:%M:%S+00:00")
+            except Exception:
+                pass
     if job.source_url:
         job_posting["applicantContact"] = {
             "@type": "ContactPoint",
@@ -672,6 +695,14 @@ async def job_detail_page(
     if not job:
         return HTMLResponse("<h1>Job not found</h1>", status_code=404)
 
+    # Expired / removed postings must not be served as live, indexable pages.
+    # Google's job-posting guidance: once a job is gone, return 404/410 (or
+    # noindex) — otherwise the stale page is reclassified "crawled – currently
+    # not indexed" and erodes crawl trust for the whole sitemap. We return 410
+    # with a noindex "this job has closed" page that links back to live jobs.
+    if _is_expired_job(job):
+        return await _render_expired_job(request, job, session)
+
     job_obj = _job_to_template_obj(job)
 
     # Similar jobs — same employer first; if not enough, top up with same primary category
@@ -739,6 +770,33 @@ async def job_detail_page(
         "similar_jobs": similar_jobs,
         "employer_panel": employer_panel,
     })
+
+
+async def _render_expired_job(request: Request, job: Job, session: AsyncSession):
+    """Render the 'this job has closed' page for an expired posting: HTTP 410
+    (Gone), noindex (no JobPosting JSON-LD), and a handful of live jobs in the
+    same category so the visitor — and crawlers — have somewhere live to go."""
+    similar_rows: list[Job] = []
+    if job.categories:
+        similar_rows = (await session.execute(
+            select(Job)
+            .where(Job.status == "active")
+            .where(Job.id != job.id)
+            .where(Job.categories.any(job.categories[0]))
+            .order_by(Job.date_posted.desc().nullslast())
+            .limit(6)
+        )).scalars().all()
+    similar_jobs = [_job_to_template_obj(r) for r in similar_rows]
+    return templates.TemplateResponse(
+        request,
+        "job_expired.html",
+        {
+            "job": _job_to_template_obj(job),
+            "canonical_url": _canonical_url(f"/jobs/{job.id}"),
+            "similar_jobs": similar_jobs,
+        },
+        status_code=410,
+    )
 
 
 @router.get("/for-ai", response_class=HTMLResponse)

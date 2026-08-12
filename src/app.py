@@ -155,6 +155,25 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+
+@app.middleware("http")
+async def canonical_host_redirect(request, call_next):
+    """301 apex (zammejobs.com) → www.zammejobs.com for ALL paths, not just the
+    root. Previously deep apex URLs (e.g. zammejobs.com/jobs/<id>) 404'd instead
+    of redirecting, splitting host signals and wasting crawl budget. Canonical
+    tags already point at www; this makes the redirect match. www traffic and
+    non-GET/HEAD requests pass straight through."""
+    from fastapi.responses import RedirectResponse
+
+    host = (request.headers.get("host") or "").split(":")[0].lower()
+    if host == "zammejobs.com" and request.method in ("GET", "HEAD"):
+        target = f"https://www.zammejobs.com{request.url.path}"
+        if request.url.query:
+            target = f"{target}?{request.url.query}"
+        return RedirectResponse(target, status_code=301)
+    return await call_next(request)
+
+
 app.mount("/static", StaticFiles(directory="src/static"), name="static")
 
 # API routes
