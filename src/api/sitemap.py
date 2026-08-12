@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from fastapi import APIRouter, Depends, Request
 from fastapi.responses import PlainTextResponse, Response
-from sqlalchemy import func, select, text
+from sqlalchemy import func, or_, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.config import settings
@@ -303,9 +303,15 @@ async def sitemap_jobs(
     session: AsyncSession = Depends(get_session),
 ):
     base = "https://www.zammejobs.com"
+    # Only live URLs belong in the sitemap. status='active' is the primary gate;
+    # the date_expires guard is belt-and-braces so a job carrying an explicit
+    # past source expiry is dropped even if the status flip (mark_stale_jobs /
+    # feed reconciliation) hasn't caught up yet. A sitemap full of expired URLs
+    # destroys Google's trust in it and throttles crawling of the fresh jobs.
     result = await session.execute(
         select(Job.id, Job.date_updated)
         .where(Job.status == "active")
+        .where(or_(Job.date_expires.is_(None), Job.date_expires > func.now()))
         .order_by(Job.date_posted.desc().nullslast())
         .limit(50000)
     )

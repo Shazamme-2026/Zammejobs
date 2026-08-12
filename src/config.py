@@ -38,6 +38,12 @@ class Settings(BaseSettings):
     # against a silent ingestion stall going unnoticed.
     alert_email: str = "rick@shazamme.com"
     freshness_alert_minutes: int = 90
+    # A job is considered live for this many days after we last confirmed it in
+    # a source crawl (date_updated). mark_stale_jobs flips anything older to
+    # status='expired', and the JSON-LD validThrough is derived from the same
+    # window so a still-crawled listing never advertises a lapsed expiry to
+    # Google. Single source of truth for the whole expiry model.
+    stale_job_days: int = 30
 
     # Aggregator API keys (all optional — connector self-disables if missing)
     adzuna_app_id: str = ""

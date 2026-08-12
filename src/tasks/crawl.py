@@ -600,16 +600,21 @@ def harvest_common_crawl(
 
 @celery_app.task
 def mark_stale_jobs():
-    """Mark jobs as expired if not updated in 30 days.
+    """Mark jobs as expired if not updated in `settings.stale_job_days` days.
 
     Loosened from 7 → 30 days because the stale threshold was triggering on
     seed data that hadn't yet been re-crawled by the auto-pipeline. The
     correct freshness signal is per-source `last_crawl_at` + per-source
     interval (handled in crawl_all_due_sources), not a global cutoff.
+
+    This window is the single source of truth for the expiry model: the
+    JSON-LD validThrough for jobs without an explicit source expiry is derived
+    from the same date_updated + stale_job_days, so a still-crawled listing
+    never advertises a lapsed expiry to Google.
     """
     session = _get_sync_session()
     try:
-        threshold = datetime.utcnow() - timedelta(days=30)
+        threshold = datetime.utcnow() - timedelta(days=settings.stale_job_days)
 
         # Snapshot the IDs being expired so we can notify Google + IndexNow.
         from sqlalchemy import select as sa_select

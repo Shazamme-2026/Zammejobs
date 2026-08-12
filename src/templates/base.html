@@ -5,18 +5,18 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>{% block title %}ZammeJobs{% endblock %}</title>
     <meta name="description" content="{% block meta_description %}Every job. Every ATS. AI-searchable. Free global job index from corporate career sites.{% endblock %}">
-    <link rel="canonical" href="{% block canonical %}{{ canonical_url or request.url }}{% endblock %}">
+    <link rel="canonical" href="{% block canonical %}{{ canonical_url or ('https://www.zammejobs.com' ~ request.url.path) }}{% endblock %}">
     {% block og_meta %}
     <meta property="og:type" content="website">
     <meta property="og:site_name" content="ZammeJobs">
     <meta property="og:title" content="{{ self.title() }}">
     <meta property="og:description" content="{{ self.meta_description() }}">
-    <meta property="og:url" content="{{ canonical_url or request.url }}">
+    <meta property="og:url" content="{{ canonical_url or ('https://www.zammejobs.com' ~ request.url.path) }}">
     <meta name="twitter:card" content="summary_large_image">
     <meta name="twitter:title" content="{{ self.title() }}">
     <meta name="twitter:description" content="{{ self.meta_description() }}">
     {% endblock %}
-    <meta name="robots" content="index, follow, max-snippet:-1, max-image-preview:large">
+    <meta name="robots" content="{% block robots %}index, follow, max-snippet:-1, max-image-preview:large{% endblock %}">
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800;900&display=swap" rel="stylesheet">
