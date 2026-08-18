@@ -179,6 +179,7 @@ def crawl_source(self, source_config_id: str):
             jobs_updated = 0
             new_urls: list[str] = []
             seen_source_ids: set[str] = set()
+            seen_content_hashes: set[str] = set()
             prev_job_count = config.last_crawl_job_count or 0
 
             for raw_job in raw_jobs:
@@ -186,6 +187,8 @@ def crawl_source(self, source_config_id: str):
                     job = _run_async(normalize_job(raw_job, do_geocode=False))
                     if job.source_id:
                         seen_source_ids.add(job.source_id)
+                    if job.content_hash:
+                        seen_content_hashes.add(job.content_hash)
                     result = _upsert_job(session, job)
                     if result == "new":
                         jobs_new += 1
@@ -204,10 +207,14 @@ def crawl_source(self, source_config_id: str):
             # closed jobs linger until the 30-day mark_stale_jobs timer —
             # inflating the active index (Aequor showed 32.5K vs 9.3K live).
             # Guarded by _should_reconcile so a truncated feed can't mass-expire.
-            if config.source_type == "shazamme_feed" and seen_source_ids:
-                if _should_reconcile(prev_job_count, len(raw_jobs), settings.reconcile_min_ratio):
+            if config.source_type == "shazamme_feed" and seen_content_hashes:
+                # Reconcile on distinct content, not raw row count: the feed
+                # repeats each job under many GUIDs, so len(raw_jobs) is wildly
+                # inflated and can't gauge truncation. The number of distinct
+                # jobs actually present (seen_content_hashes) is the real signal.
+                if _should_reconcile(prev_job_count, len(seen_content_hashes), settings.reconcile_min_ratio):
                     expired_ids = _reconcile_feed_snapshot(
-                        session, config.source_type, seen_source_ids
+                        session, config.source_type, seen_content_hashes
                     )
                     if expired_ids:
                         logger.info(
@@ -217,9 +224,9 @@ def crawl_source(self, source_config_id: str):
                         _notify_jobs_deleted(expired_ids)
                 else:
                     logger.warning(
-                        "Reconcile SKIPPED for %s: pull %d < %.0f%% of last good %d "
+                        "Reconcile SKIPPED for %s: %d distinct jobs < %.0f%% of last good %d "
                         "(suspected feed truncation)",
-                        source_desc, len(raw_jobs),
+                        source_desc, len(seen_content_hashes),
                         settings.reconcile_min_ratio * 100, prev_job_count,
                     )
 
@@ -252,7 +259,10 @@ def crawl_source(self, source_config_id: str):
 
             config.last_crawl_at = datetime.utcnow()
             config.last_crawl_status = "success"
-            config.last_crawl_job_count = len(raw_jobs)
+            # Store distinct-content count (not raw rows) so the truncation
+            # guard's prev/curr comparison is apples-to-apples for a feed that
+            # repeats each job under many GUIDs.
+            config.last_crawl_job_count = len(seen_content_hashes) or len(raw_jobs)
 
             session.commit()
 
@@ -305,7 +315,49 @@ def crawl_source(self, source_config_id: str):
 
 
 def _upsert_job(session, job: Job) -> str:
-    """Insert or update a job. Returns 'new' or 'updated'."""
+    """Insert or update a job, deduplicating on CONTENT, not source_id.
+
+    The Shazamme feed emits a fresh source_id (GUID) for the same posting on
+    repeated pulls *and* re-sends historical GUIDs, so keying only on
+    (source_type, source_id) let one job accumulate as thousands of distinct
+    rows (129K active rows for ~79K real jobs). We therefore treat
+    (source_type, content_hash) as the identity of an active job: if one is
+    already active we refresh it in place rather than inserting a twin. The
+    original source_id is left untouched so uq_source can't be violated and
+    reconciliation (now content-hash based) stays consistent. Returns 'new'
+    or 'updated'.
+    """
+    existing_id = session.execute(
+        select(Job.id)
+        .where(Job.source_type == job.source_type)
+        .where(Job.content_hash == job.content_hash)
+        .where(Job.status == "active")
+        .limit(1)
+    ).scalar()
+
+    if existing_id is not None:
+        session.execute(
+            update(Job)
+            .where(Job.id == existing_id)
+            .values(
+                source_url=job.source_url,
+                title=job.title,
+                description_html=job.description_html,
+                description_text=job.description_text,
+                location_raw=job.location_raw,
+                location_city=job.location_city,
+                location_state=job.location_state,
+                location_country=job.location_country,
+                salary_raw=job.salary_raw,
+                salary_min=job.salary_min,
+                salary_max=job.salary_max,
+                date_updated=datetime.utcnow(),
+                status="active",
+                raw_data=job.raw_data,
+            )
+        )
+        return "updated"
+
     stmt = insert(Job).values(
         id=job.id,
         content_hash=job.content_hash,
@@ -378,19 +430,24 @@ def _should_reconcile(prev_count: int, curr_count: int, min_ratio: float) -> boo
     return curr_count >= prev_count * min_ratio
 
 
-def _reconcile_feed_snapshot(session, source_type: str, seen_source_ids: set) -> list:
-    """Expire active jobs of `source_type` whose source_id was absent from the
+def _reconcile_feed_snapshot(session, source_type: str, seen_content_hashes: set) -> list:
+    """Expire active jobs of `source_type` whose content was absent from the
     latest full feed pull. Returns the expired job IDs.
+
+    Keyed on content_hash rather than source_id: the Shazamme feed hands the
+    same posting a new GUID every pull, so a source_id-based membership test
+    would never recognize a job as still-present and would churn endlessly.
+    Content identity is stable across pulls.
 
     Only safe for full-snapshot feeds (Shazamme) — never for paginated
     connectors that emit partial per-page results.
     """
     rows = session.execute(
-        select(Job.id, Job.source_id)
+        select(Job.id, Job.content_hash)
         .where(Job.source_type == source_type)
         .where(Job.status == "active")
     ).all()
-    stale_ids = [r[0] for r in rows if r[1] and r[1] not in seen_source_ids]
+    stale_ids = [r[0] for r in rows if r[1] and r[1] not in seen_content_hashes]
     if not stale_ids:
         return []
 

@@ -45,6 +45,7 @@ async def main():
     new = upd = errs = 0
     new_urls: list[str] = []
     seen_source_ids: set[str] = set()
+    seen_content_hashes: set[str] = set()
 
     # One long-lived session with batched commits instead of a fresh
     # session+commit per job. 38K individual transactions on the shared prod
@@ -55,6 +56,7 @@ async def main():
     processed = 0
     s = Session()
     try:
+        from sqlalchemy import select as sa_select, update as sa_update
         for raw in raw_jobs:
             if raw.source_id:
                 seen_source_ids.add(raw.source_id)
@@ -65,38 +67,65 @@ async def main():
                 logger.warning("Normalize failed: %s", str(e)[:150])
                 continue
 
+            if job.content_hash:
+                seen_content_hashes.add(job.content_hash)
+
             try:
-                stmt = insert(Job).values(
-                    id=job.id, content_hash=job.content_hash,
-                    source_type=job.source_type, source_id=job.source_id,
-                    source_url=job.source_url, ats_platform=job.ats_platform,
-                    title=job.title, description_html=job.description_html,
-                    description_text=job.description_text,
-                    employer_name=job.employer_name, employer_domain=job.employer_domain,
-                    employer_logo_url=job.employer_logo_url,
-                    location_raw=job.location_raw, location_city=job.location_city,
-                    location_state=job.location_state, location_country=job.location_country,
-                    is_remote=job.is_remote, remote_type=job.remote_type,
-                    salary_min=job.salary_min, salary_max=job.salary_max,
-                    salary_currency=job.salary_currency, salary_period=job.salary_period,
-                    salary_raw=job.salary_raw, employment_type=job.employment_type,
-                    categories=job.categories, seniority=job.seniority,
-                    date_posted=job.date_posted, date_expires=job.date_expires,
-                    date_crawled=job.date_crawled, date_updated=job.date_updated,
-                    status=job.status, raw_data=job.raw_data,
-                ).on_conflict_do_update(
-                    constraint="uq_source",
-                    set_={"title": job.title, "description_html": job.description_html,
-                          "salary_raw": job.salary_raw, "date_updated": datetime.utcnow(),
-                          "status": "active", "raw_data": job.raw_data},
-                )
+                # Dedup on CONTENT, not source_id. The feed re-lists the same
+                # posting under a fresh GUID every pull, so a source_id upsert
+                # piles up thousands of twins. If an active row already has this
+                # content_hash, refresh it in place; otherwise insert (still
+                # guarding uq_source for a same-GUID re-pull).
                 with s.begin_nested():
-                    result = s.execute(stmt)
-                if result.inserted_primary_key:
-                    new += 1
-                    new_urls.append(f"https://{settings.site_domain}/jobs/{job.id}")
-                else:
-                    upd += 1
+                    existing_id = s.execute(
+                        sa_select(Job.id)
+                        .where(Job.source_type == job.source_type)
+                        .where(Job.content_hash == job.content_hash)
+                        .where(Job.status == "active")
+                        .limit(1)
+                    ).scalar()
+                    if existing_id is not None:
+                        s.execute(
+                            sa_update(Job).where(Job.id == existing_id).values(
+                                source_url=job.source_url, title=job.title,
+                                description_html=job.description_html,
+                                salary_raw=job.salary_raw,
+                                date_updated=datetime.utcnow(),
+                                status="active", raw_data=job.raw_data,
+                            )
+                        )
+                        upd += 1
+                    else:
+                        stmt = insert(Job).values(
+                            id=job.id, content_hash=job.content_hash,
+                            source_type=job.source_type, source_id=job.source_id,
+                            source_url=job.source_url, ats_platform=job.ats_platform,
+                            title=job.title, description_html=job.description_html,
+                            description_text=job.description_text,
+                            employer_name=job.employer_name, employer_domain=job.employer_domain,
+                            employer_logo_url=job.employer_logo_url,
+                            location_raw=job.location_raw, location_city=job.location_city,
+                            location_state=job.location_state, location_country=job.location_country,
+                            is_remote=job.is_remote, remote_type=job.remote_type,
+                            salary_min=job.salary_min, salary_max=job.salary_max,
+                            salary_currency=job.salary_currency, salary_period=job.salary_period,
+                            salary_raw=job.salary_raw, employment_type=job.employment_type,
+                            categories=job.categories, seniority=job.seniority,
+                            date_posted=job.date_posted, date_expires=job.date_expires,
+                            date_crawled=job.date_crawled, date_updated=job.date_updated,
+                            status=job.status, raw_data=job.raw_data,
+                        ).on_conflict_do_update(
+                            constraint="uq_source",
+                            set_={"title": job.title, "description_html": job.description_html,
+                                  "salary_raw": job.salary_raw, "date_updated": datetime.utcnow(),
+                                  "status": "active", "raw_data": job.raw_data},
+                        )
+                        result = s.execute(stmt)
+                        if result.inserted_primary_key:
+                            new += 1
+                            new_urls.append(f"https://{settings.site_domain}/jobs/{job.id}")
+                        else:
+                            upd += 1
             except Exception as e:
                 errs += 1
                 logger.warning("Upsert failed: %s", str(e)[:150])
@@ -121,23 +150,23 @@ async def main():
     # a plausibly-complete snapshot — a short feed must NOT mass-expire live
     # jobs. Healthy feed ~38K; the flap drops to ~6K, below reconcile_min_jobs.
     expired_urls: list[str] = []
-    if seen_source_ids and len(seen_source_ids) < settings.reconcile_min_jobs:
+    if seen_content_hashes and len(seen_content_hashes) < settings.reconcile_min_jobs:
         logger.warning(
-            "Reconcile SKIPPED: only %d jobs in feed (< floor %d) — suspected truncation",
-            len(seen_source_ids), settings.reconcile_min_jobs,
+            "Reconcile SKIPPED: only %d distinct jobs in feed (< floor %d) — suspected truncation",
+            len(seen_content_hashes), settings.reconcile_min_jobs,
         )
-    elif seen_source_ids:
+    elif seen_content_hashes:
         from sqlalchemy import select, update as sa_update
         from datetime import datetime as _dt
         with Session() as s:
             stale_rows = s.execute(
-                select(Job.id, Job.source_id)
+                select(Job.id, Job.content_hash)
                 .where(Job.source_type == "shazamme_feed")
                 .where(Job.status == "active")
             ).all()
             stale_ids = [
                 row[0] for row in stale_rows
-                if row[1] and row[1] not in seen_source_ids
+                if row[1] and row[1] not in seen_content_hashes
             ]
             if stale_ids:
                 s.execute(
