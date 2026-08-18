@@ -41,26 +41,18 @@ def _hide(conn) -> int:
     return result.rowcount
 
 
-def _restore_falsely_expired_shazamme(conn) -> int:
-    """Undo expiry of Shazamme rows that the apply-route liveness check
-    (now removed) wrongly marked expired. Only touches rows still in
-    the feed — joined back via source_id."""
-    result = conn.execute(text("""
-        UPDATE jobs
-        SET status = 'active',
-            date_updated = NOW()
-        WHERE source_type = 'shazamme_feed'
-          AND status = 'expired'
-    """))
-    return result.rowcount
-
-
 def main() -> None:
     engine = create_engine(settings.database_url_sync)
     with engine.begin() as conn:
-        n_restored = _restore_falsely_expired_shazamme(conn)
-        if n_restored:
-            print(f"sync_shazamme_visibility: restored {n_restored} Shazamme rows from 'expired'", flush=True)
+        # NOTE: this used to blanket-revive EVERY expired shazamme_feed row to
+        # 'active' on every boot/crawl to undo a since-removed apply-route
+        # liveness bug. Despite the docstring it had no feed-membership check,
+        # so it also resurrected legitimately-expired rows: jobs that left the
+        # feed AND the duplicate rows that feed-snapshot reconciliation had just
+        # expired. That silently neutered reconciliation (active count grew to
+        # 129K for ~31K real jobs) and un-deindexed expired SEO pages. The
+        # correct liveness signal is now content-hash reconciliation in
+        # crawl.py / import_shazamme.py, so the blanket revive is removed.
         if not settings.shazamme_only_ingestion:
             n = _restore(conn)
             print(f"sync_shazamme_visibility: flag OFF, restored {n} jobs", flush=True)
